@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.snapshot_audit import snapshot_audit_store
 from app.store import store
 
 
@@ -22,6 +23,14 @@ class SnapshotMgrService(BaseModuleService):
             return int(val)
         except (ValueError, TypeError):
             return default
+
+    def domain_read_abnormal_entries(self, comparison_id: str = "S13") -> dict[str, Any]:
+        """异常条目读取：输出快照内重复路径与证据缺失条目，供待核清单消费。"""
+        return snapshot_audit_store.read_abnormal_entries(comparison_id)
+
+    def domain_build_diff_checklist(self, comparison_id: str = "S13") -> dict[str, Any]:
+        """生成快照差异待核清单：可证差异交审计，无证据差异保留为待核项。"""
+        return snapshot_audit_store.build_checklist(comparison_id)
 
     def domain_create_snapshot(self, entry_id: int) -> dict[str, Any]:
         """对当前数据执行存储，联动导出和回填处理，产出标准化记录。处理流程：读取配置→执行存储→导出校验→回填批次→写入存储，下游可消费且批次可追溯。"""

@@ -77,5 +77,22 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 快照差异审计（S13 工作台）
+
+快照内同路径重复条目不做最后一条覆盖：`app/compute.py` 的 `snapshot_differ`
+按路径分组、按校验值多重集合比较（顺序无关），把差异拆成可证项与待证项，
+无证据差异进入待核清单且不按零计。完整签核状态机在 `app/snapshot_audit.py`，
+路由前缀 `/api/snapshot-audit`（注册于资源动态路由之前）：
+
+- `GET  /comparisons/S13/abnormal-entries`：异常条目读取（重复路径、证据缺失）
+- `POST /comparisons/S13/checklist`：生成快照差异待核清单（保留原文件顺序）
+- `POST /comparisons/S13/reorder?path=...`：交换同路径重复条目顺序
+- `POST /comparisons/S13/audit`：发起审计，`boundary=item|snapshot` 记录签核边界
+- `POST /comparisons/S13/signoff`：逐项可只签已证实条目；整张则冻结整份快照
+- `POST /comparisons/S13/evidence`：补证（可模拟失败，重试复用首份结论）
+- `POST /comparisons/S13/reopen`：补全后重开清单，保留已核范围与签核次数
+
+前端入口：侧边栏「快照差异审计」（`/snapshot-audit`，`SnapshotAuditView.vue`）。
+
 领域：数据工程
 子方向：数仓与数据湖

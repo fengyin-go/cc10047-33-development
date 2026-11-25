@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.snapshot_audit import snapshot_audit_store
 from app.store import store
 
 
@@ -20,6 +21,23 @@ class LakeAuditService(BaseModuleService):
     def _safe_int(self, val: Any, default: int = 0) -> int:
         try: return int(val)
         except (ValueError, TypeError): return default
+
+    def domain_audit_todo(self, comparison_id: str = "S13") -> dict[str, Any]:
+        """读取审计待办：签核结果已回写，未定范围证据汇总在待核清单中。"""
+        comparison = snapshot_audit_store.get_comparison(comparison_id)
+        return {
+            "ok": True,
+            "comparison_id": comparison_id,
+            "boundary": comparison["boundary"],
+            "status": comparison["status"],
+            "signoff_count": comparison["signoff_count"],
+            "attempt_count": comparison["attempt_count"],
+            "conclusion": comparison["conclusion"],
+            "audited_item_keys": comparison["audited_item_keys"],
+            "waiting_item_keys": comparison["waiting_item_keys"],
+            "audit_todo": comparison["audit_todo"],
+            "checklist": comparison["checklist"],
+        }
 
     def domain_run_audit(self, entry_id: int) -> dict[str, Any]:
         """对当前数据执行状态，联动状态和处理处理，产出标准化记录。处理流程：读取配置→执行状态→状态校验→处理批次→写入存储，下游可消费且批次可追溯。"""

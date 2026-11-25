@@ -80,9 +80,30 @@ class TestSnapshotDiffer:
             {"path": "b.parquet", "checksum": "def", "rows": 200}
         ]}
         result = snapshot_differ(base, curr)
+        # 文件数按实际检测到的差异计数
         assert result["added_files"] == 1
         assert result["removed_files"] == 1
+        # 未提供证据：差异不能按零计，进入待核清单并保留行数口径，
+        # 已证实行数保持 0，而不是把无法确认的差异吞掉。
+        assert result["proven_diff_items"] == 0
+        assert result["pending_diff_items"] == 2
+        assert result["pending_rows"] == 300  # 新增 200 + 删除 100 均待证
+        assert result["added_rows"] == 0
+        assert result["removed_rows"] == 0
+
+    def test_evidence_moves_diff_into_proven(self):
+        base = {"snapshot_id": "s1", "files": [
+            {"path": "a.parquet", "checksum": "abc", "rows": 100}
+        ]}
+        curr = {"snapshot_id": "s2", "files": [
+            {"path": "b.parquet", "checksum": "def", "rows": 200}
+        ]}
+        result = snapshot_differ(base, curr, evidence={"b.parquet": {"type": "add"}})
+        # 有证据的新增进入可证口径，无证据的删除仍待核
+        assert result["proven_diff_items"] == 1
+        assert result["pending_diff_items"] == 1
         assert result["added_rows"] == 200
+        assert result["removed_rows"] == 0
 
     def test_modified(self):
         base = {"snapshot_id": "s1", "files": [

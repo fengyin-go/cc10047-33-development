@@ -94,40 +94,192 @@ def compaction_planner(
 # snapshot_differ
 # ------------------------------------------------------------------
 
+def _index_files(files: list[dict[str, Any]]) -> dict[Any, list[dict[str, Any]]]:
+    """按 path 分组但不覆盖同路径重复条目：每个路径保留一个有序条目列表。
+
+    旧实现用 ``{f["path"]: f}`` 建索引，快照内同路径多份条目会被最后一条
+    静默覆盖，审计详情里无法确认的差异也随之丢失，这里改为分组列表。
+    """
+    grouped: dict[Any, list[dict[str, Any]]] = {}
+    for index, file_entry in enumerate(files):
+        entry = dict(file_entry)
+        entry.setdefault("_order", index)
+        grouped.setdefault(file_entry.get("path"), []).append(entry)
+    return grouped
+
+
+def _checksum_multiset(entries: list[dict[str, Any]]) -> dict[Any, int]:
+    """同路径条目按校验值计数：只看校验值集合，不看排列顺序。"""
+    counts: dict[Any, int] = {}
+    for entry in entries:
+        checksum = entry.get("checksum")
+        counts[checksum] = counts.get(checksum, 0) + 1
+    return counts
+
+
+def _make_diff_item(
+    change_type: str,
+    path: Any,
+    base_entries: list[dict[str, Any]],
+    curr_entries: list[dict[str, Any]],
+    order: int,
+) -> dict[str, Any]:
+    """构造一条差异待核项，保留原文件顺序与同路径重复条目的全部校验值。"""
+    base_checksums = [entry.get("checksum") for entry in base_entries]
+    curr_checksums = [entry.get("checksum") for entry in curr_entries]
+    duplicate = len(base_entries) > 1 or len(curr_entries) > 1
+    return {
+        "key": f"{change_type}:{path}",
+        "change_type": change_type,  # added / removed / modified / duplicate_conflict
+        "path": path,
+        "order": order,
+        "base_entries": [
+            {key: value for key, value in entry.items() if not key.startswith("_")}
+            for entry in base_entries
+        ],
+        "current_entries": [
+            {key: value for key, value in entry.items() if not key.startswith("_")}
+            for entry in curr_entries
+        ],
+        "base_checksums": base_checksums,
+        "current_checksums": curr_checksums,
+        "duplicate_path": duplicate,
+        "base_rows": sum(int(entry.get("rows", 0) or 0) for entry in base_entries),
+        "current_rows": sum(int(entry.get("rows", 0) or 0) for entry in curr_entries),
+    }
+
+
 def snapshot_differ(
     base_snapshot: dict[str, Any],
     current_snapshot: dict[str, Any],
+    evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """比较两个快照的差异，输出新增/更新/删除的数据分布。"""
-    base_files = base_snapshot.get("files", [])
-    curr_files = current_snapshot.get("files", [])
+    """比较两个快照的文件清单，输出新增/删除/修改/重复路径冲突的待核清单。
 
-    base_set = {f.get("path"): f for f in base_files}
-    curr_set = {f.get("path"): f for f in curr_files}
+    与旧实现的区别：
 
-    added = [f for path, f in curr_set.items() if path not in base_set]
-    removed = [f for path, f in base_set.items() if path not in curr_set]
-    modified = []
-    for path in base_set.keys() & curr_set.keys():
-        bf = base_set[path]
-        cf = curr_set[path]
-        if bf.get("checksum") != cf.get("checksum"):
-            modified.append({"path": path, "old": bf, "new": cf})
+    * 快照内同路径重复条目不互相覆盖，重复路径单独标记 ``duplicate_path``；
+    * 同路径条目按校验值多重集合比较，交换排列顺序不会被判成变化；
+    * 差异拆成 ``proven_items``（有证据）与 ``pending_items``（证据缺失，
+      即快照差异待核清单），没有证据的差异不会被按零计，也不会进入已证实统计；
+    * 每条差异保留其在原清单中的顺序（``order``），审计工作台按原顺序展示。
+    """
+    evidence = evidence or {}
+    base_files = list(base_snapshot.get("files", []))
+    curr_files = list(current_snapshot.get("files", []))
+    base_grouped = _index_files(base_files)
+    curr_grouped = _index_files(curr_files)
 
-    total_added_rows = sum(f.get("rows", 0) for f in added)
-    total_removed_rows = sum(f.get("rows", 0) for f in removed)
-    total_modified_rows = sum(f["new"].get("rows", 0) for f in modified)
+    diff_items: list[dict[str, Any]] = []
+    order_counter = 0
+    all_paths: list[Any] = []
+    for path in [entry.get("path") for entry in base_files] + [
+        entry.get("path") for entry in curr_files
+    ]:
+        if path not in all_paths:
+            all_paths.append(path)
+
+    for path in all_paths:
+        base_entries = base_grouped.get(path, [])
+        curr_entries = curr_grouped.get(path, [])
+        base_multiset = _checksum_multiset(base_entries)
+        curr_multiset = _checksum_multiset(curr_entries)
+
+        if base_multiset == curr_multiset:
+            # 校验值多重集合一致：即便同路径条目排列顺序不同，也不构成差异。
+            continue
+
+        if not base_entries:
+            change_type = "added"
+        elif not curr_entries:
+            change_type = "removed"
+        elif len(base_entries) > 1 or len(curr_entries) > 1:
+            # 同路径存在重复条目且校验值对不平：重复路径与有效变化冲突，
+            # 不能用最后一条覆盖，需要人工补证后逐项核对。
+            change_type = "duplicate_conflict"
+        else:
+            change_type = "modified"
+
+        diff_items.append(
+            _make_diff_item(change_type, path, base_entries, curr_entries, order_counter)
+        )
+        order_counter += 1
+
+    proven_items: list[dict[str, Any]] = []
+    pending_items: list[dict[str, Any]] = []
+    duplicate_paths: list[dict[str, Any]] = []
+    for item in diff_items:
+        path = item["path"]
+        item_evidence = evidence.get(path) if isinstance(evidence, dict) else None
+        # 证据若声明了 covered_checksums，则必须覆盖该差异涉及的全部校验值；
+        # 部分覆盖（如重复路径只有一条有证据）仍判定为证据缺失。
+        if item_evidence and isinstance(item_evidence.get("covered_checksums"), list):
+            required = (
+                item["base_checksums"] if item["change_type"] == "removed"
+                else item["current_checksums"]
+            )
+            if any(checksum not in item_evidence["covered_checksums"] for checksum in required):
+                item_evidence = None
+        item["evidence"] = item_evidence
+        item["evidence_status"] = "proven" if item_evidence else "pending"
+        if item_evidence:
+            proven_items.append(item)
+        else:
+            pending_items.append(item)
+        if item["duplicate_path"]:
+            duplicate_paths.append({
+                "path": path,
+                "base_checksums": item["base_checksums"],
+                "current_checksums": item["current_checksums"],
+                "change_type": item["change_type"],
+                "order": item["order"],
+            })
+
+    # 已证实行数只统计有证据的差异；待证差异不按零计，单独给出 pending 口径，
+    # 避免审计详情把无法确认的差异吞掉。
+    proven_added_rows = sum(
+        item["current_rows"] for item in proven_items if item["change_type"] == "added"
+    )
+    proven_removed_rows = sum(
+        item["base_rows"] for item in proven_items if item["change_type"] == "removed"
+    )
+    proven_modified_rows = sum(
+        item["current_rows"] for item in proven_items
+        if item["change_type"] in ("modified", "duplicate_conflict")
+    )
+    pending_rows = sum(
+        item["current_rows"] if item["change_type"] != "removed" else item["base_rows"]
+        for item in pending_items
+    )
+
+    type_counts = {
+        change_type: sum(1 for item in diff_items if item["change_type"] == change_type)
+        for change_type in ("added", "removed", "modified", "duplicate_conflict")
+    }
 
     return {
         "base_snapshot_id": base_snapshot.get("snapshot_id"),
         "current_snapshot_id": current_snapshot.get("snapshot_id"),
-        "added_files": len(added),
-        "removed_files": len(removed),
-        "modified_files": len(modified),
-        "added_rows": total_added_rows,
-        "removed_rows": total_removed_rows,
-        "modified_rows": total_modified_rows,
-        "net_change_rows": total_added_rows - total_removed_rows,
+        # 文件数口径：按实际检测到的差异计数（含待证项），重复路径不再被覆盖。
+        "added_files": type_counts["added"],
+        "removed_files": type_counts["removed"],
+        "modified_files": type_counts["modified"],
+        "duplicate_conflict_files": type_counts["duplicate_conflict"],
+        # 行数控口径：只累加已证实差异；未证实差异不按零计，走 pending_rows。
+        "added_rows": proven_added_rows,
+        "removed_rows": proven_removed_rows,
+        "modified_rows": proven_modified_rows,
+        "net_change_rows": proven_added_rows - proven_removed_rows,
+        # 新口径：可证差异交给审计，无证据差异进入待核清单。
+        "total_diff_items": len(diff_items),
+        "proven_diff_items": len(proven_items),
+        "pending_diff_items": len(pending_items),
+        "pending_rows": pending_rows,
+        "duplicate_paths": duplicate_paths,
+        "proven_items": proven_items,
+        "pending_items": pending_items,
+        "diff_items": diff_items,
+        "order_preserved": [item["path"] for item in diff_items],
     }
 
 
